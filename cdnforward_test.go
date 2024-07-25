@@ -1,6 +1,7 @@
 package cdnforward
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/coredns/coredns/plugin/dnstap"
 	"github.com/coredns/coredns/plugin/pkg/proxy"
 	"github.com/coredns/coredns/plugin/pkg/transport"
+	"github.com/miekg/dns"
 )
 
 func TestList(t *testing.T) {
@@ -75,6 +77,19 @@ func TestSetTapPlugin(t *testing.T) {
 		t.Error("Unexpected order of dnstap plugins")
 	}
 }
-func NewTestSetTapPlugin() {
+
+
+func TestOveriding(t *testing.T) {
 	fmt.Println("sss")
+	input := `cdnforward . 1.1.1.1`
+	stanzas := strings.Split(input, "\n")
+	c := caddy.NewTestController("dns", strings.Join(stanzas[1:], "\n"))
+	f, ok := dnsserver.GetConfig(c).Handler("forward").(*Forward)
+	if ok {
+		fmt.Println(ok)
+	}
+
+	fs, s := f.ServeDNS(context.Background(), &dnsserver.DoHWriter{}, &dns.Msg{})
+	fmt.Println(fs, s)
+
 }

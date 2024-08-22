@@ -344,7 +344,6 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 				}
 			}
 		}
-		fmt.Println("Forwarding --------------------------------------------")
 	
 		placeholds := placeholder{
 			hold: true,
@@ -357,7 +356,7 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		}
 
 		for placeholds.hold && placeholds.donecount < len(f.Jsondata.Overider){
-			fmt.Println("holding")
+
 		}
 		newans := ret.Answer
 		w.WriteMsg(ret)

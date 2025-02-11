@@ -22,7 +22,7 @@ import (
 )
 
 func init() {
-	plugin.Register("forward", setup)
+	plugin.Register("cdnforward", setup)
 }
 
 func setup(c *caddy.Controller) error {
@@ -169,6 +169,8 @@ func parseStanza(c *caddy.Controller) (*Forward, error) {
 }
 
 func parseBlock(c *caddy.Controller, f *Forward) error {
+	alloveriders := []overiderconfig{}
+	
 	config := dnsserver.GetConfig(c)
 	switch c.Val() {
 	case "except":
@@ -179,6 +181,45 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 		for i := 0; i < len(ignore); i++ {
 			f.ignored = append(f.ignored, plugin.Host(ignore[i]).NormalizeExact()...)
 		}
+	case "override":
+		if !c.Next() {
+			return c.ArgErr()
+		}
+		maybebool := c.Val()
+		conf := overiderconfig{
+			answeres: c.RemainingArgs(),
+		}
+		parsed, err := strconv.ParseBool(maybebool)
+		if err != nil {
+			conf.answeres = append(conf.answeres, maybebool)
+		}
+		conf.forceclean = parsed
+		conf.answeres = append(conf.answeres, c.RemainingArgs()...)
+		if !c.NextLine() {
+			return c.ArgErr()
+		}
+		conf.cidrRng = c.RemainingArgs()
+		alloveriders = append(alloveriders, conf)
+
+		// var err error
+		// for c.NextBlock() {
+		// 	switch c.Val() {
+		// 	case "ip":
+		// 		conf.answeres = append(conf.answeres, c.RemainingArgs()...)
+		// 	case "forceclean":
+		// 		if !c.Next() {
+		// 			return c.ArgErr()
+		// 		}
+		// 		conf.forceclean, err = strconv.ParseBool(c.Val())
+		// 		if err != nil {
+		// 			return errors.New("parsing error when parsing forceclean")
+		// 		}
+		// 	case "range":
+		// 		conf.cidrRng =append(conf.cidrRng, c.RemainingArgs()...)
+		// 	}
+		// }
+		alloveriders = append(alloveriders, conf)
+		
 	case "max_fails":
 		if !c.NextArg() {
 			return c.ArgErr()
@@ -219,7 +260,6 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 				return fmt.Errorf("health_check: unknown option %s", hcOpts)
 			}
 		}
-
 	case "force_tcp":
 		if c.NextArg() {
 			return c.ArgErr()
@@ -309,8 +349,7 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 	default:
 		return c.Errf("unknown property '%s'", c.Val())
 	}
-
-	return nil
+	return f.RegisterOveriders(alloveriders)
 }
 
 const max = 15 // Maximum number of upstreams.

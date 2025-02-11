@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"net"
 	"sync/atomic"
 	"time"
 
@@ -22,9 +23,11 @@ import (
 	"github.com/miekg/dns"
 	ot "github.com/opentracing/opentracing-go"
 	otext "github.com/opentracing/opentracing-go/ext"
+
+	"github.com/yl2chen/cidranger"
 )
 
-var log = clog.NewWithPlugin("forward")
+var log = clog.NewWithPlugin("cdnforward")
 
 const (
 	defaultExpire = 10 * time.Second
@@ -60,7 +63,109 @@ type Forward struct {
 	tapPlugins []*dnstap.Dnstap // when dnstap plugins are loaded, we use to this to send messages out.
 
 	Next plugin.Handler
+
+	ipnets []ipunit
+
 }
+
+type ipunit struct {
+	cidranger.Ranger
+	addr net.IP
+	forceclean bool
+	preAnswereIPV4 []dns.RR
+	preAnswereIPV6 []dns.RR
+}
+
+type overiderconfig struct {
+	answeres []string
+	cidrRng []string
+	forceclean bool
+}
+
+func (i ipunit) forceChaqngeSelect(ipv4, ipv6 bool, name string) []dns.RR {
+	pre := []dns.RR{}
+	if ipv4 {
+		for _, k := range i.preAnswereIPV4 {
+			k.Header().Name = name
+			pre = append(pre, k)
+		}
+		
+	}
+	if ipv6 {
+		for _, k := range i.preAnswereIPV4 {
+			k.Header().Name = name
+			pre = append(pre, k)
+		}
+	}
+	
+	return pre
+
+}
+func (f *Forward) RegisterOveriders(overides []overiderconfig)  error {
+	if len(overides) == 0 {
+		return nil
+	}
+
+	for _, r := range overides {
+		if len(r.answeres) ==0 || len(r.cidrRng) == 0 {
+			return errors.New("pre answere and cidr range length cannot be zero")
+		}
+		ranger := cidranger.NewPCTrieRanger()
+		for _, cidr := range r.cidrRng {
+			_, ipNet, err := net.ParseCIDR(cidr)
+			if err != nil {
+				log.Fatal(err)
+			}
+			err = ranger.Insert(cidranger.NewBasicRangerEntry(*ipNet))
+			if err != nil {
+				log.Fatal(err)
+			}
+			//allipnets = append(allipnets, ipNet)
+		}
+	
+		var (
+			ipv4, ipv6 []dns.RR
+		)
+		for _, l := range r.answeres {
+			ip := net.ParseIP(l)
+			if ip.To4() == nil {
+				ipv6 = append(ipv6, &dns.AAAA{
+					Hdr: dns.RR_Header{
+						Rrtype: dns.TypeAAAA,
+						Rdlength: 16,
+						Ttl: 300,
+						Class: dns.ClassINET,
+					},
+					AAAA: ip,
+				})
+			} else {
+				ipv4 = append(ipv4, &dns.A{
+					Hdr: dns.RR_Header{
+						Rrtype: dns.TypeA,
+						Rdlength: 4,
+						Ttl: 300,
+						Class: dns.ClassINET,
+					},
+					A: ip.To4(),
+				})
+			}
+			
+			
+		}
+	
+		ii := ipunit{
+			Ranger: ranger,
+			addr: net.ParseIP(r.answeres[0]),
+			forceclean: r.forceclean,
+			preAnswereIPV4: ipv4,
+			preAnswereIPV6: ipv6,
+		}
+		f.ipnets = append(f.ipnets,  ii)
+	}
+
+	return nil
+}
+
 
 // New returns a new Forward.
 func New() *Forward {
@@ -86,7 +191,7 @@ func (f *Forward) SetTapPlugin(tapPlugin *dnstap.Dnstap) {
 func (f *Forward) Len() int { return len(f.proxies) }
 
 // Name implements plugin.Handler.
-func (f *Forward) Name() string { return "forward" }
+func (f *Forward) Name() string { return "cdnforward" }
 
 // ServeDNS implements plugin.Handler.
 func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
@@ -205,6 +310,60 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			}
 		}
 
+		//var changeallRecord bool
+		var (
+			fakeloop bool
+			foundipv6 bool
+			foundipv4 bool
+			ipunit ipunit
+			name string
+		)
+		answere:
+		for i, answere := range ret.Answer {
+			switch dnsAns := answere.(type) {
+			case *dns.AAAA:
+				foundipv6 = true
+				if fakeloop {
+					continue answere
+			    }
+				for j, r := range f.ipnets {
+				   cont,err := f.ipnets[j].Ranger.Contains(dnsAns.AAAA)
+				   if err != nil {
+					   continue
+				   }
+				   if r.forceclean {
+						fakeloop = true
+						ipunit = f.ipnets[j]
+						name = dnsAns.Hdr.Name
+					}
+				   if cont {
+					   ret.Answer[i] = &dns.AAAA{Hdr: dnsAns.Hdr, AAAA: r.addr}
+				   }
+			   }
+			case *dns.A:
+				foundipv4 = true
+				if fakeloop {
+					continue
+				}
+				for j, r := range f.ipnets {
+					cont,err := f.ipnets[j].Ranger.Contains(dnsAns.A)
+					if err != nil {
+						continue
+					}
+					if r.forceclean {
+						fakeloop = true
+						ipunit = f.ipnets[j]
+						name = dnsAns.Hdr.Name
+					}
+					if cont {
+						ret.Answer[i] = &dns.A{Hdr: dnsAns.Hdr, A: r.addr}
+					}
+				}
+			}
+		}
+		if fakeloop {
+			ret.Answer = ipunit.forceChaqngeSelect(foundipv4, foundipv6, name)
+		}
 		w.WriteMsg(ret)
 		return 0, nil
 	}
@@ -220,7 +379,6 @@ func (f *Forward) match(state request.Request) bool {
 	if !plugin.Name(f.from).Matches(state.Name()) || !f.isAllowedDomain(state.Name()) {
 		return false
 	}
-
 	return true
 }
 
@@ -228,7 +386,6 @@ func (f *Forward) isAllowedDomain(name string) bool {
 	if dns.Name(name) == dns.Name(f.from) {
 		return true
 	}
-
 	for _, ignore := range f.ignored {
 		if plugin.Name(ignore).Matches(name) {
 			return false

@@ -10,6 +10,7 @@ import (
 	"github.com/coredns/coredns/plugin/dnstap"
 	"github.com/coredns/coredns/plugin/pkg/proxy"
 	"github.com/coredns/coredns/plugin/pkg/transport"
+	"github.com/miekg/dns"
 )
 
 func TestList(t *testing.T) {
@@ -72,5 +73,26 @@ func TestSetTapPlugin(t *testing.T) {
 	}
 	if f.tapPlugins[0] != tap || tap.Next != f.tapPlugins[1] {
 		t.Error("Unexpected order of dnstap plugins")
+	}
+}
+
+func TestSendDNSQuestion(t *testing.T) {
+	// Create a DNS question
+	question := new(dns.Msg)
+	question.SetQuestion("example.com.", dns.TypeA)
+
+	// Send the DNS question to 127.0.0.1:53
+	client := new(dns.Client)
+	response, _, err := client.Exchange(question, " 192.168.194.5:53")
+	if err != nil {
+		t.Fatalf("Failed to send DNS question: %v", err)
+	}
+
+	// Check the response
+	if response == nil {
+		t.Fatal("Expected a response, got nil")
+	}
+	if response.Rcode != dns.RcodeSuccess {
+		t.Fatalf("Expected RcodeSuccess, got: %v", response.Rcode)
 	}
 }

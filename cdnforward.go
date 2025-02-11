@@ -2,19 +2,12 @@
 // client returns the upstream's Conn will be precached. Depending on how you benchmark this looks to be
 // 50% faster than just opening a new connection for every client. It works with UDP and TCP and uses
 // inband healthchecking.
-package cdnforward
+package forward
 
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"net"
-	"os"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,12 +24,11 @@ import (
 	otext "github.com/opentracing/opentracing-go/ext"
 )
 
-var log = clog.NewWithPlugin("cdn")
+var log = clog.NewWithPlugin("forward")
 
 const (
 	defaultExpire = 10 * time.Second
 	hcInterval    = 500 * time.Millisecond
-
 )
 
 // Forward represents a plugin instance that can proxy requests to another (DNS) server. It has a list
@@ -66,148 +58,14 @@ type Forward struct {
 	ErrLimitExceeded error
 
 	tapPlugins []*dnstap.Dnstap // when dnstap plugins are loaded, we use to this to send messages out.
+
 	Next plugin.Handler
-	
-	Jsondata Data
-	DNSupdater *Updatedns
-	logfile *fileOBJ
-
-
 }
-
-
-type fileOBJ struct {
-	writer io.Writer
-}
-
-//writing logs to txt file(extranal thread)
 
 // New returns a new Forward.
 func New() *Forward {
 	f := &Forward{maxfails: 2, tlsConfig: new(tls.Config), expire: defaultExpire, p: new(random), from: ".", hcInterval: hcInterval, opts: proxy.Options{ForceTCP: false, PreferUDP: false, HCRecursionDesired: true, HCDomain: "."}}
-	f.Jsondata = Data{}
-	f.Jsondata.Loadjson("config.json")
-	f.DNSupdater = &Updatedns{
-		interval: f.Jsondata.Interval,
-		data: &f.Jsondata,
-		
-	}
-	f.DNSupdater.startupdater()
-	file, err := os.OpenFile(f.Jsondata.Logfilename, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Println("can't open log file lod wo'nt work")
-	}
-	f.logfile = &fileOBJ{
-		writer: file,
-	}
-	time.Sleep(5 * time.Second)
-	fmt.Println(f.DNSupdater)
-
 	return f
-}
-type Data struct {
-	Dns_server string `json:"dns_server"`
-	Dns_server_port string `json:"dns_server_port"`
-	Interval time.Duration `json:"interval"`
-	Logfilename string `json:"logfilename"`
-	Overider []Overiderraw`json:"overider"`
-}
-
-type Overiderraw struct {
-	Overide_domain string `json:"overide_domain"`
-    Ip_ranges []string `json:"ip_ranges"`
-	Overidehttps bool `json:"overidehttps"`
-}
-
-type Updatedns struct {
-	Answer []dns.RR
-	interval time.Duration
-	data *Data
-	Overide []overiitem
-	
-}
-type overiitem struct {
-	Overide_domain string 
-	Ip_ranges []string 
-	ipv4 []string
-	ipv6 []string
-	overidehttps bool
-
-}
-type Ipavbl struct {
-	isavbl bool
-}
-type placeholder struct {
-	hold bool
-	donecount int
-}
-
-func (s *Data)Loadjson(loca string) {
-	file, _ := os.ReadFile(loca)
-
-	err := json.Unmarshal(file, s)
-	if err != nil {
-		panic(err)
-	}
-
-}
-func logwriter(ss io.Writer, contet []dns.RR) {
-	for _, v := range contet {
-		_, err := ss.Write([]byte(v.String() + "\n"))
-		if err != nil {
-			fmt.Println(err)
-		}
-	}
-}
-
-func updatingadr(update *Updatedns, overideinfo Overiderraw, dnsserver string) {
-	newoveriitem := overiitem{
-		Overide_domain: overideinfo.Overide_domain,
-		Ip_ranges: overideinfo.Ip_ranges,
-		overidehttps: overideinfo.Overidehttps,
-	}
-	client := dns.Client{}
-	r := dns.Msg{}
-	r.SetQuestion(dns.Fqdn(overideinfo.Overide_domain), dns.TypeA)
-	m := dns.Msg{}
-	m.SetQuestion(dns.Fqdn(overideinfo.Overide_domain), dns.TypeAAAA)
-	replyIPv4, _, err := client.Exchange(&r, dnsserver)
-	for _, val := range replyIPv4.Answer {
-		if a, ok := val.(*dns.A); ok {
-
-			newoveriitem.ipv4 = append(newoveriitem.ipv4, a.A.String())
-		}
-
-	}
-	fmt.Println(err)
-	replyIPv6, _, err := client.Exchange(&m, dnsserver)
-	for _, val := range replyIPv6.Answer {
-		if a, ok := val.(*dns.AAAA); ok {
-			newoveriitem.ipv6 = append(newoveriitem.ipv6, a.AAAA.String())
-		}
-
-	}
-	fmt.Println(err)
-
-	update.Overide = append(update.Overide, newoveriitem)
-
-
-}
-
-//Updating main domain dns record according to given duration
-func updating(info *Updatedns, data *Data) {
-	fmt.Println("updater started")
-	for {
-		for _, in := range data.Overider {
-			go updatingadr(info, in, data.Dns_server+":"+ data.Dns_server_port)
-		}
-		time.Sleep(info.interval * time.Minute)
-	}
-
-}
-// startin updaters
-func (s *Updatedns) startupdater() {
-	go updating(s, s.data)
 }
 
 // SetProxy appends p to the proxy list and starts healthchecking.
@@ -228,11 +86,10 @@ func (f *Forward) SetTapPlugin(tapPlugin *dnstap.Dnstap) {
 func (f *Forward) Len() int { return len(f.proxies) }
 
 // Name implements plugin.Handler.
-func (f *Forward) Name() string { return "cdn" }
+func (f *Forward) Name() string { return "forward" }
 
 // ServeDNS implements plugin.Handler.
 func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
-	
 	state := request.Request{W: w, Req: r}
 	if !f.match(state) {
 		return plugin.NextOrFailure(f.Name(), f.Next, ctx, w, r)
@@ -273,6 +130,7 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			// select an upstream to connect to.
 			r := new(random)
 			proxy = r.List(f.proxies)[0]
+
 			healthcheckBrokenCount.Add(1)
 		}
 
@@ -281,6 +139,7 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			otext.PeerAddress.Set(child, proxy.Addr())
 			ctx = ot.ContextWithSpan(ctx, child)
 		}
+
 		metadata.SetValueFunc(ctx, "forward/upstream", func() string {
 			return proxy.Addr()
 		})
@@ -293,6 +152,7 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 
 		for {
 			ret, err = proxy.Connect(ctx, state, opts)
+
 			if err == ErrCachedClosed { // Remote side closed conn, can only happen with TCP.
 				continue
 			}
@@ -344,23 +204,8 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 				}
 			}
 		}
-	
-		placeholds := placeholder{
-			hold: true,
-			donecount: 0,
-			
-		}
 
-		for _, index := range f.DNSupdater.Overide {
-			go CheckIptooveride(index, &placeholds, ret.Answer, ret)
-		}
-
-		for placeholds.hold && placeholds.donecount < len(f.Jsondata.Overider){
-
-		}
-		newans := ret.Answer
 		w.WriteMsg(ret)
-		go logwriter(f.logfile.writer, newans)
 		return 0, nil
 	}
 
@@ -370,66 +215,6 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 
 	return dns.RcodeServerFailure, ErrNoHealthy
 }
-
-
-func CheckIptooveride(Overide overiitem, placeholder *placeholder, answeres []dns.RR, dnsMSg *dns.Msg) {
-	boolvl := ipselector(answeres, Overide.Ip_ranges)
-
-	if boolvl {
-		addrtable := Overide.ipv4
-		addrtableAAA := Overide.ipv6
-
-		ii := 0
-		iia := 0
-
-		replicate := dnsMSg.Answer
-		replicateplus := 0
-
-		for innn, answer := range dnsMSg.Answer {
-			if a, ok := answer.(*dns.A); ok {
-				if ii > len(addrtable)-1{
-					replicate = append(replicate[:innn-replicateplus], replicate[innn+1-replicateplus:]...)
-					replicateplus++
-				} else {
-					a.A = net.ParseIP(addrtable[ii]).To4()
-					s, _ :=  replicate[innn-replicateplus].(*dns.A)
-					s.A = net.ParseIP(addrtable[ii]).To4()
-				}
-				ii = ii + 1
-
-			}
-			if aaa, okk := answer.(*dns.AAAA); okk {
-				if iia > len(addrtableAAA)-1{
-					replicate = append(replicate[:innn-replicateplus], replicate[innn+1-replicateplus:]...)
-					replicateplus++
-				} else {
-					aaa.AAAA = net.ParseIP(addrtableAAA[iia]).To16()
-					l, _ :=  replicate[innn-replicateplus].(*dns.AAAA)
-					l.AAAA = net.ParseIP(addrtableAAA[iia]).To16()
-				}
-				
-				iia = iia + 1
-
-			}
-			
-			// if https, yes := answer.(*dns.HTTPS); yes || Overide.overidehttps {
-			// 	fmt.Println(https)
-			// 	fmt.Println(https.SVCB.Value)
-			// }
-			// fmt.Println(answer.(*dns.HTTPS))
-		}
-
-		dnsMSg.Answer = replicate
-		placeholder.donecount++
-		placeholder.hold = false
-	
-	} else {
-		placeholder.donecount++
-	}
-
-}
-
-
 
 func (f *Forward) match(state request.Request) bool {
 	if !plugin.Name(f.from).Matches(state.Name()) || !f.isAllowedDomain(state.Name()) {
@@ -483,51 +268,3 @@ type Options struct {
 }
 
 var defaultTimeout = 5 * time.Second
-
-
-
-
-
-
-func ipselector(answ []dns.RR, iprange []string) bool {
-	ip := "ss"
-	for mmm := range answ {
-		ip = strings.Split(answ[mmm].String(), "\t")[4]
-		ipAddri := net.ParseIP(ip)
-		if ipAddri != nil {
-			sss, _ := ipINCIDRlist(ip, iprange)
-			return sss
-		}
-	}
-	ss, _ := ipINCIDRlist(ip, iprange)
-	return ss
-}
-
-
-func ipInCIDRs(ip, cidr string, ch *Ipavbl, wg *sync.WaitGroup) {
-    ipAddr := net.ParseIP(ip)
-    _, ipNet, _ := net.ParseCIDR(cidr)
-	if ipNet.Contains(ipAddr) {
-		ch.isavbl = true
-	}
-	wg.Done()
-}
-
-
-func ipINCIDRlist(ip string, cidr []string) (bool, error) {
-	ipAddr := net.ParseIP(ip)
-
-	if ipAddr == nil {
-		return false, nil
-	}
-	check := Ipavbl{
-		isavbl: false,
-	}
-	wg := &sync.WaitGroup{}
-	for _, v := range cidr {
-		wg.Add(1)
-		go ipInCIDRs(ip, v, &check, wg)
-	}
-	wg.Wait()
-	return check.isavbl, nil
-}

@@ -1,6 +1,6 @@
 //go:build gofuzz
 
-package cdnforward
+package forward
 
 import (
 	"github.com/coredns/coredns/plugin/pkg/dnstest"
@@ -17,8 +17,8 @@ var f *Forward
 func init() {
 	f = New()
 	s := dnstest.NewServer(r{}.reflectHandler)
-	f.SetProxy(proxy.NewProxy(s.Addr, "tcp"))
-	f.SetProxy(proxy.NewProxy(s.Addr, "udp"))
+	f.SetProxy(proxy.NewProxy("FuzzForwardPlugin1", s.Addr, "tcp"))
+	f.SetProxy(proxy.NewProxy("FuzzForwardPlugin2", s.Addr, "udp"))
 }
 
 // Fuzz fuzzes forward.

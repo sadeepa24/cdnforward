@@ -72,8 +72,8 @@ type ipunit struct {
 	cidranger.Ranger
 	addr net.IP
 	forceclean bool
-	preAnswereIPV4 []dns.RR
-	preAnswereIPV6 []dns.RR
+	preAnswereIPV4 []dns.A
+	preAnswereIPV6 []dns.AAAA
 }
 
 type overiderconfig struct {
@@ -82,86 +82,87 @@ type overiderconfig struct {
 	forceclean bool
 }
 
-func (i ipunit) forceChaqngeSelect(ipv4, ipv6 bool, name string) []dns.RR {
+func (i ipunit) forceChaqngeSelect(ipv4, ipv6 bool, name string, answerCount int) []dns.RR {
 	pre := []dns.RR{}
+
 	if ipv4 {
 		for _, k := range i.preAnswereIPV4 {
 			k.Header().Name = name
-			pre = append(pre, k)
+			pre = append(pre, &k)
 		}
-		
+	}
+	if len(pre) >= answerCount {
+		return pre
 	}
 	if ipv6 {
-		for _, k := range i.preAnswereIPV4 {
+		for _, k := range i.preAnswereIPV6 {
 			k.Header().Name = name
-			pre = append(pre, k)
+			pre = append(pre, &k)
 		}
 	}
 	
 	return pre
 
 }
-func (f *Forward) RegisterOveriders(overides []overiderconfig)  error {
-	if len(overides) == 0 {
-		return nil
+func (f *Forward) RegisterOveriders(overides overiderconfig)  error {
+	if len(overides.answeres) ==0 || len(overides.cidrRng) == 0 {
+		return errors.New("pre answere and cidr range length cannot be zero")
+	}
+	ranger := cidranger.NewPCTrieRanger()
+	for _, cidr := range overides.cidrRng {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = ranger.Insert(cidranger.NewBasicRangerEntry(*ipNet))
+		if err != nil {
+			log.Fatal(err)
+		}
+		//allipnets = append(allipnets, ipNet)
 	}
 
-	for _, r := range overides {
-		if len(r.answeres) ==0 || len(r.cidrRng) == 0 {
-			return errors.New("pre answere and cidr range length cannot be zero")
+	var (
+		ipv4 []dns.A
+		ipv6 []dns.AAAA
+	)
+	for _, l := range overides.answeres {
+		ip := net.ParseIP(l)
+		if ip.To4() == nil {
+			ipv6 = append(ipv6, dns.AAAA{
+				Hdr: dns.RR_Header{
+					Rrtype: dns.TypeAAAA,
+					Rdlength: 16,
+					Ttl: 300,
+					Class: dns.ClassINET,
+				},
+				AAAA: ip,
+			})
+		} else {
+			ipv4 = append(ipv4, dns.A{
+				Hdr: dns.RR_Header{
+					Rrtype: dns.TypeA,
+					Rdlength: 4,
+					Ttl: 300,
+					Class: dns.ClassINET,
+				},
+				A: ip.To4(),
+			})
 		}
-		ranger := cidranger.NewPCTrieRanger()
-		for _, cidr := range r.cidrRng {
-			_, ipNet, err := net.ParseCIDR(cidr)
-			if err != nil {
-				log.Fatal(err)
-			}
-			err = ranger.Insert(cidranger.NewBasicRangerEntry(*ipNet))
-			if err != nil {
-				log.Fatal(err)
-			}
-			//allipnets = append(allipnets, ipNet)
-		}
-	
-		var (
-			ipv4, ipv6 []dns.RR
-		)
-		for _, l := range r.answeres {
-			ip := net.ParseIP(l)
-			if ip.To4() == nil {
-				ipv6 = append(ipv6, &dns.AAAA{
-					Hdr: dns.RR_Header{
-						Rrtype: dns.TypeAAAA,
-						Rdlength: 16,
-						Ttl: 300,
-						Class: dns.ClassINET,
-					},
-					AAAA: ip,
-				})
-			} else {
-				ipv4 = append(ipv4, &dns.A{
-					Hdr: dns.RR_Header{
-						Rrtype: dns.TypeA,
-						Rdlength: 4,
-						Ttl: 300,
-						Class: dns.ClassINET,
-					},
-					A: ip.To4(),
-				})
-			}
-			
-			
-		}
-	
-		ii := ipunit{
-			Ranger: ranger,
-			addr: net.ParseIP(r.answeres[0]),
-			forceclean: r.forceclean,
-			preAnswereIPV4: ipv4,
-			preAnswereIPV6: ipv6,
-		}
-		f.ipnets = append(f.ipnets,  ii)
+		
+		
 	}
+
+	if len(ipv4) == 0 {
+		return errors.New("at least 1 ip addres should be given to overide")
+	}
+
+	f.ipnets = append(f.ipnets,  ipunit{
+		Ranger: ranger,
+		addr: net.ParseIP(overides.answeres[0]),
+		forceclean: overides.forceclean,
+		preAnswereIPV4: ipv4,
+		preAnswereIPV6: ipv6,
+	})
 
 	return nil
 }
@@ -249,6 +250,8 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			return proxy.Addr()
 		})
 
+		
+
 		var (
 			ret *dns.Msg
 			err error
@@ -272,6 +275,7 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		if child != nil {
 			child.Finish()
 		}
+		
 
 		if len(f.tapPlugins) != 0 {
 			toDnstap(ctx, f, proxy.Addr(), state, opts, ret, start)
@@ -317,7 +321,13 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			foundipv4 bool
 			ipunit ipunit
 			name string
+			
 		)
+
+		//ret.
+		
+		
+
 		answere:
 		for i, answere := range ret.Answer {
 			switch dnsAns := answere.(type) {
@@ -331,10 +341,11 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 				   if err != nil {
 					   continue
 				   }
-				   if r.forceclean {
+				   if r.forceclean && cont {
 						fakeloop = true
 						ipunit = f.ipnets[j]
 						name = dnsAns.Hdr.Name
+						break
 					}
 				   if cont {
 					   ret.Answer[i] = &dns.AAAA{Hdr: dnsAns.Hdr, AAAA: r.addr}
@@ -346,14 +357,15 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 					continue
 				}
 				for j, r := range f.ipnets {
-					cont,err := f.ipnets[j].Ranger.Contains(dnsAns.A)
+					cont,err := f.ipnets[j].Ranger.Contains(dnsAns.A.To4())
 					if err != nil {
 						continue
 					}
-					if r.forceclean {
+					if r.forceclean && cont {
 						fakeloop = true
 						ipunit = f.ipnets[j]
 						name = dnsAns.Hdr.Name
+						break
 					}
 					if cont {
 						ret.Answer[i] = &dns.A{Hdr: dnsAns.Hdr, A: r.addr}
@@ -362,7 +374,10 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			}
 		}
 		if fakeloop {
-			ret.Answer = ipunit.forceChaqngeSelect(foundipv4, foundipv6, name)
+			ans := ipunit.forceChaqngeSelect(foundipv4, foundipv6, name, len(ret.Answer))
+			if len(ans) != 0 {
+				ret.Answer = ans
+			}
 		}
 		w.WriteMsg(ret)
 		return 0, nil

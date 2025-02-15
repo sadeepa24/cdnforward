@@ -169,7 +169,7 @@ func parseStanza(c *caddy.Controller) (*Forward, error) {
 }
 
 func parseBlock(c *caddy.Controller, f *Forward) error {
-	alloveriders := []overiderconfig{}
+	//alloveriders := []overiderconfig{}
 	
 	config := dnsserver.GetConfig(c)
 	switch c.Val() {
@@ -199,7 +199,6 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 			return c.ArgErr()
 		}
 		conf.cidrRng = c.RemainingArgs()
-		alloveriders = append(alloveriders, conf)
 
 		// var err error
 		// for c.NextBlock() {
@@ -218,7 +217,10 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 		// 		conf.cidrRng =append(conf.cidrRng, c.RemainingArgs()...)
 		// 	}
 		// }
-		alloveriders = append(alloveriders, conf)
+		fmt.Println(conf)
+		if err := f.RegisterOveriders(conf); err != nil {
+			return err
+		}
 		
 	case "max_fails":
 		if !c.NextArg() {
@@ -349,7 +351,8 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 	default:
 		return c.Errf("unknown property '%s'", c.Val())
 	}
-	return f.RegisterOveriders(alloveriders)
+	return nil
+	//return f.RegisterOveriders(alloveriders)
 }
 
 const max = 15 // Maximum number of upstreams.

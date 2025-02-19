@@ -1,4 +1,4 @@
-package cdnforward
+package forward
 
 import (
 	"context"

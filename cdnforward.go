@@ -2,7 +2,7 @@
 // client returns the upstream's Conn will be precached. Depending on how you benchmark this looks to be
 // 50% faster than just opening a new connection for every client. It works with UDP and TCP and uses
 // inband healthchecking.
-package cdnforward
+package forward
 
 import (
 	"context"
@@ -70,10 +70,36 @@ type Forward struct {
 
 type ipunit struct {
 	cidranger.Ranger
-	addr net.IP
+	// addr net.IP
 	forceclean bool
 	preAnswereIPV4 []dns.A
 	preAnswereIPV6 []dns.AAAA
+	allipv4 []net.IP
+	allipv6 []net.IP
+	ipv4count int //for faster checking
+	ipv6count int
+}
+
+var (
+	ErrorAddrOver = errors.New("ip addres over, no any other ip available")
+	ErrorAddresTypeMissmatch = errors.New("addres type fault")
+)
+
+func (iunit ipunit) getaddr(i int, addrtype string) (net.IP, error) {
+	switch addrtype {
+	case "ipv4":
+		if i < iunit.ipv4count {
+			return iunit.allipv4[i], nil
+		}
+		return iunit.allipv4[0], ErrorAddrOver
+	case "ipv6":
+		if i < iunit.ipv6count {
+			return iunit.allipv6[i], nil
+		}
+		return net.IPv6zero, ErrorAddrOver
+	}
+	return net.IPv4zero, ErrorAddresTypeMissmatch
+
 }
 
 type overiderconfig struct {
@@ -124,6 +150,8 @@ func (f *Forward) RegisterOveriders(overides overiderconfig)  error {
 	var (
 		ipv4 []dns.A
 		ipv6 []dns.AAAA
+
+		ip4, ip6 []net.IP
 	)
 	for _, l := range overides.answeres {
 		ip := net.ParseIP(l)
@@ -137,6 +165,7 @@ func (f *Forward) RegisterOveriders(overides overiderconfig)  error {
 				},
 				AAAA: ip,
 			})
+			ip6 = append(ip6, ip)
 		} else {
 			ipv4 = append(ipv4, dns.A{
 				Hdr: dns.RR_Header{
@@ -147,6 +176,7 @@ func (f *Forward) RegisterOveriders(overides overiderconfig)  error {
 				},
 				A: ip.To4(),
 			})
+			ip4 = append(ip4, ip.To4())
 		}
 		
 		
@@ -158,10 +188,15 @@ func (f *Forward) RegisterOveriders(overides overiderconfig)  error {
 
 	f.ipnets = append(f.ipnets,  ipunit{
 		Ranger: ranger,
-		addr: net.ParseIP(overides.answeres[0]),
+		//addr: net.ParseIP(overides.answeres[0]),
 		forceclean: overides.forceclean,
 		preAnswereIPV4: ipv4,
 		preAnswereIPV6: ipv6,
+		ipv4count: len(ip4),
+		ipv6count: len(ip6),
+		allipv4: ip4,
+		allipv6: ip6,
+	
 	})
 
 	return nil
@@ -321,17 +356,20 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			foundipv4 bool
 			ipunit ipunit
 			name string
+			v6 int
+			v4 int
 			
 		)
 
 		//ret.
 		
-		
+		var elseans []dns.RR
 
 		answere:
 		for i, answere := range ret.Answer {
 			switch dnsAns := answere.(type) {
 			case *dns.AAAA:
+				
 				foundipv6 = true
 				if fakeloop {
 					continue answere
@@ -348,10 +386,16 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 						break
 					}
 				   if cont {
-					   ret.Answer[i] = &dns.AAAA{Hdr: dnsAns.Hdr, AAAA: r.addr}
+					   addr, err := r.getaddr(v6, "ipv6")
+					   if err == nil {
+						   ret.Answer[i] =  &dns.AAAA{Hdr: dnsAns.Hdr, AAAA: addr}
+					   }
+					   break
 				   }
-			   }
+			   	}
+			   v6++		   
 			case *dns.A:
+				
 				foundipv4 = true
 				if fakeloop {
 					continue
@@ -368,16 +412,27 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 						break
 					}
 					if cont {
-						ret.Answer[i] = &dns.A{Hdr: dnsAns.Hdr, A: r.addr}
+
+						addr, err := r.getaddr(v4, "ipv4")
+						if err == nil {
+							ret.Answer[i] = &dns.A{Hdr: dnsAns.Hdr, A: addr}
+						}
+						break
 					}
 				}
+				v4++
+			case *dns.HTTPS:
+				//dns.HTTPS
+				//TODO: replace with preconfigure https answere in ipunit
+				continue
+			default:
+				elseans = append(elseans, ret.Answer[i])
 			}
 		}
 		if fakeloop {
 			ans := ipunit.forceChaqngeSelect(foundipv4, foundipv6, name, len(ret.Answer))
-			if len(ans) != 0 {
-				ret.Answer = ans
-			}
+			ans = append(ans, elseans...)
+			if len(ans) != 0 { ret.Answer = ans }
 		}
 		w.WriteMsg(ret)
 		return 0, nil

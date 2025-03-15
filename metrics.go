@@ -1,4 +1,4 @@
-package forward
+package cdnforward
 
 import (
 	"github.com/coredns/coredns/plugin"

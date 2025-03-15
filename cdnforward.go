@@ -2,12 +2,13 @@
 // client returns the upstream's Conn will be precached. Depending on how you benchmark this looks to be
 // 50% faster than just opening a new connection for every client. It works with UDP and TCP and uses
 // inband healthchecking.
-package forward
+package cdnforward
 
 import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"net"
 	"sync/atomic"
 	"time"
 
@@ -22,9 +23,11 @@ import (
 	"github.com/miekg/dns"
 	ot "github.com/opentracing/opentracing-go"
 	otext "github.com/opentracing/opentracing-go/ext"
+
+	"github.com/yl2chen/cidranger"
 )
 
-var log = clog.NewWithPlugin("forward")
+var log = clog.NewWithPlugin("cdnforward")
 
 const (
 	defaultExpire = 10 * time.Second
@@ -60,7 +63,145 @@ type Forward struct {
 	tapPlugins []*dnstap.Dnstap // when dnstap plugins are loaded, we use to this to send messages out.
 
 	Next plugin.Handler
+
+	ipnets []ipunit
+
 }
+
+type ipunit struct {
+	cidranger.Ranger
+	// addr net.IP
+	forceclean bool
+	preAnswereIPV4 []dns.A
+	preAnswereIPV6 []dns.AAAA
+	allipv4 []net.IP
+	allipv6 []net.IP
+	ipv4count int //for faster checking
+	ipv6count int
+}
+
+var (
+	ErrorAddrOver = errors.New("ip addres over, no any other ip available")
+	ErrorAddresTypeMissmatch = errors.New("addres type fault")
+)
+
+func (iunit ipunit) getaddr(i int, addrtype string) (net.IP, error) {
+	switch addrtype {
+	case "ipv4":
+		if i < iunit.ipv4count {
+			return iunit.allipv4[i], nil
+		}
+		return iunit.allipv4[0], ErrorAddrOver
+	case "ipv6":
+		if i < iunit.ipv6count {
+			return iunit.allipv6[i], nil
+		}
+		return net.IPv6zero, ErrorAddrOver
+	}
+	return net.IPv4zero, ErrorAddresTypeMissmatch
+
+}
+
+type overiderconfig struct {
+	answeres []string
+	cidrRng []string
+	forceclean bool
+}
+
+func (i ipunit) forceChaqngeSelect(ipv4, ipv6 bool, name string, answerCount int) []dns.RR {
+	pre := []dns.RR{}
+
+	if ipv4 {
+		for _, k := range i.preAnswereIPV4 {
+			k.Header().Name = name
+			pre = append(pre, &k)
+		}
+	}
+	if len(pre) >= answerCount {
+		return pre
+	}
+	if ipv6 {
+		for _, k := range i.preAnswereIPV6 {
+			k.Header().Name = name
+			pre = append(pre, &k)
+		}
+	}
+	
+	return pre
+
+}
+func (f *Forward) RegisterOveriders(overides overiderconfig)  error {
+	if len(overides.answeres) ==0 || len(overides.cidrRng) == 0 {
+		return errors.New("pre answere and cidr range length cannot be zero")
+	}
+	ranger := cidranger.NewPCTrieRanger()
+	for _, cidr := range overides.cidrRng {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = ranger.Insert(cidranger.NewBasicRangerEntry(*ipNet))
+		if err != nil {
+			log.Fatal(err)
+		}
+		//allipnets = append(allipnets, ipNet)
+	}
+
+	var (
+		ipv4 []dns.A
+		ipv6 []dns.AAAA
+
+		ip4, ip6 []net.IP
+	)
+	for _, l := range overides.answeres {
+		ip := net.ParseIP(l)
+		if ip.To4() == nil {
+			ipv6 = append(ipv6, dns.AAAA{
+				Hdr: dns.RR_Header{
+					Rrtype: dns.TypeAAAA,
+					Rdlength: 16,
+					Ttl: 300,
+					Class: dns.ClassINET,
+				},
+				AAAA: ip,
+			})
+			ip6 = append(ip6, ip)
+		} else {
+			ipv4 = append(ipv4, dns.A{
+				Hdr: dns.RR_Header{
+					Rrtype: dns.TypeA,
+					Rdlength: 4,
+					Ttl: 300,
+					Class: dns.ClassINET,
+				},
+				A: ip.To4(),
+			})
+			ip4 = append(ip4, ip.To4())
+		}
+		
+		
+	}
+
+	if len(ipv4) == 0 {
+		return errors.New("at least 1 ip addres should be given to overide")
+	}
+
+	f.ipnets = append(f.ipnets,  ipunit{
+		Ranger: ranger,
+		//addr: net.ParseIP(overides.answeres[0]),
+		forceclean: overides.forceclean,
+		preAnswereIPV4: ipv4,
+		preAnswereIPV6: ipv6,
+		ipv4count: len(ip4),
+		ipv6count: len(ip6),
+		allipv4: ip4,
+		allipv6: ip6,
+	
+	})
+
+	return nil
+}
+
 
 // New returns a new Forward.
 func New() *Forward {
@@ -86,7 +227,7 @@ func (f *Forward) SetTapPlugin(tapPlugin *dnstap.Dnstap) {
 func (f *Forward) Len() int { return len(f.proxies) }
 
 // Name implements plugin.Handler.
-func (f *Forward) Name() string { return "forward" }
+func (f *Forward) Name() string { return "cdnforward" }
 
 // ServeDNS implements plugin.Handler.
 func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
@@ -144,6 +285,8 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			return proxy.Addr()
 		})
 
+		
+
 		var (
 			ret *dns.Msg
 			err error
@@ -167,6 +310,7 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		if child != nil {
 			child.Finish()
 		}
+		
 
 		if len(f.tapPlugins) != 0 {
 			toDnstap(ctx, f, proxy.Addr(), state, opts, ret, start)
@@ -205,6 +349,91 @@ func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 			}
 		}
 
+		//var changeallRecord bool
+		var (
+			fakeloop bool
+			foundipv6 bool
+			foundipv4 bool
+			ipunit ipunit
+			name string
+			v6 int
+			v4 int
+			
+		)
+
+		//ret.
+		
+		var elseans []dns.RR
+
+		answere:
+		for i, answere := range ret.Answer {
+			switch dnsAns := answere.(type) {
+			case *dns.AAAA:
+				
+				foundipv6 = true
+				if fakeloop {
+					continue answere
+			    }
+				for j, r := range f.ipnets {
+				   cont,err := f.ipnets[j].Ranger.Contains(dnsAns.AAAA)
+				   if err != nil {
+					   continue
+				   }
+				   if r.forceclean && cont {
+						fakeloop = true
+						ipunit = f.ipnets[j]
+						name = dnsAns.Hdr.Name
+						break
+					}
+				   if cont {
+					   addr, err := r.getaddr(v6, "ipv6")
+					   if err == nil {
+						   ret.Answer[i] =  &dns.AAAA{Hdr: dnsAns.Hdr, AAAA: addr}
+					   }
+					   break
+				   }
+			   	}
+			   v6++		   
+			case *dns.A:
+				
+				foundipv4 = true
+				if fakeloop {
+					continue
+				}
+				for j, r := range f.ipnets {
+					cont,err := f.ipnets[j].Ranger.Contains(dnsAns.A.To4())
+					if err != nil {
+						continue
+					}
+					if r.forceclean && cont {
+						fakeloop = true
+						ipunit = f.ipnets[j]
+						name = dnsAns.Hdr.Name
+						break
+					}
+					if cont {
+
+						addr, err := r.getaddr(v4, "ipv4")
+						if err == nil {
+							ret.Answer[i] = &dns.A{Hdr: dnsAns.Hdr, A: addr}
+						}
+						break
+					}
+				}
+				v4++
+			case *dns.HTTPS:
+				//dns.HTTPS
+				//TODO: replace with preconfigure https answere in ipunit
+				continue
+			default:
+				elseans = append(elseans, ret.Answer[i])
+			}
+		}
+		if fakeloop {
+			ans := ipunit.forceChaqngeSelect(foundipv4, foundipv6, name, len(ret.Answer))
+			ans = append(ans, elseans...)
+			if len(ans) != 0 { ret.Answer = ans }
+		}
 		w.WriteMsg(ret)
 		return 0, nil
 	}
@@ -220,7 +449,6 @@ func (f *Forward) match(state request.Request) bool {
 	if !plugin.Name(f.from).Matches(state.Name()) || !f.isAllowedDomain(state.Name()) {
 		return false
 	}
-
 	return true
 }
 
@@ -228,7 +456,6 @@ func (f *Forward) isAllowedDomain(name string) bool {
 	if dns.Name(name) == dns.Name(f.from) {
 		return true
 	}
-
 	for _, ignore := range f.ignored {
 		if plugin.Name(ignore).Matches(name) {
 			return false
